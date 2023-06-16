@@ -20,9 +20,3 @@ Reassembly: The adjusted assembly code is reassembled into a binary via the 'as'
 
 The file to be patched is provided as a command-line argument to the script.
 
-Screenshots:
-
-
-
-
-Disclaimer: Though, the files are different in screenshots, but it works on all.
