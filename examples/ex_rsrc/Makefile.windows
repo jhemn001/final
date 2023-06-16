@@ -1,0 +1,12 @@
+CFLAGS="/Fa"
+
+all: ex.res ex.c
+	cl /nologo $(CFLAGS) ex.c /link ex.res
+	@ ex > out.txt
+ex.res: ex.rc
+	rc /nologo ex.rc
+clean:
+	del /F /Q *.exe *.obj *.exp *.def *.lib *.res *.s out.txt check.txt mllink$$.lnk
+check:
+	@ ex >check.txt
+	@ FC out.txt check.txt && echo TEST OK

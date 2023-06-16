@@ -1,0 +1,1 @@
+/usr/bin/clang    -static -Wl,--allow-multiple-definition -z execstack -z norelro CMakeFiles/ASCII_Content_Server_pov_2.dir/pov_2/pov.c.o  -o pov_2.pov ../../include/libcgc.a ../../include/libpov/libpov.a ../../include/libcgc.a ../../include/tiny-AES128-C/libtiny-AES128-C.a 

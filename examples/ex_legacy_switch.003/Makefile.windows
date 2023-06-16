@@ -1,0 +1,10 @@
+CFLAGS = "/Fa"
+
+all: ex.c
+	cl $(CFLAGS) ex.c
+	cmd /C "for %A in (750 800 900 700 500 250 100 200 600) do @ ex.exe %A" > out.txt
+clean:
+	del /F /Q *.exe *.obj *.exp *.def *.lib *.s out.txt check.txt mllink$$.lnk
+check:
+	cmd /C "for %A in (750 800 900 700 500 250 100 200 600) do @ ex.exe %A" > check.txt
+	@ FC out.txt check.txt && echo TEST OK

@@ -1,0 +1,366 @@
+//===- arm32_binaries.dl ------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019-2022 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+/**
+Define a set predicates to abstract from ARM32 specific instruction set
+and characteristics
+*/
+
+/**
+Mapping symbol names from elf: e.g., $t, $a, $d, etc.
+
+See https://sourceware.org/binutils/docs/as/ARM-Mapping-Symbols.htm
+*/
+.decl thumb_sym(Name:symbol)
+.decl arm_sym(Name:symbol)
+.decl data_sym(Name:symbol)
+
+thumb_sym("$t").
+thumb_sym(Name):-
+    defined_symbol(_,_,_,_,_,_,_,_,Name),
+    // $t.n where n is a number.
+    substr(Name,0,3) = "$t.".
+    // TODO: check the last bits are a number.
+    // e.g., substr(Name,3,len-3)
+
+arm_sym("$a").
+arm_sym(Name):-
+    defined_symbol(_,_,_,_,_,_,_,_,Name),
+    // $a.n where n is a number.
+    substr(Name,0,3) = "$a.".
+    // TODO: check the last bits are a number.
+    // e.g., substr(Name,3,len-3)
+
+data_sym("$d").
+data_sym(Name):-
+    defined_symbol(_,_,_,_,_,_,_,_,Name),
+    // $d.n where n is a number.
+    substr(Name,0,3) = "$d.".
+    // TODO: check the last bits are a number.
+    // e.g., substr(Name,3,len-3)
+
+/**
+Jump to the PC register: "bx pc"
+*/
+direct_jump(EA,Dest):-
+    arch.jump(EA),
+    instruction_get_operation(EA,Operation),
+    arch.jump_operation_op_index(Operation,TargetOpIndex),
+    instruction_get_op(EA,TargetOpIndex,TargetOp),
+    op_regdirect_contains_reg(TargetOp,Reg),
+    arch.pc_reg(Reg),
+    arch.pc_relative_disp(EA,PCRelDisp),
+    Dest0 = EA + as(PCRelDisp,address),
+    Dest = Dest0 - (Dest0 band 1).
+
+direct_call(EA,Dest):-
+    arch.call(EA,Index),
+    instruction_get_op(EA,Index,Op),
+    op_immediate(Op,Dest0),
+    !instruction_has_relocation(EA,_),
+    instruction_get_operation(EA,Operation),
+    (
+        contains("X",Operation),
+        (
+            (EA band 1) = 0, Dest = as(Dest0+1,address);
+            (EA band 1) = 1, Dest = as(Dest0,address)
+        )
+        ;
+        !contains("X",Operation),
+        Dest = as(Dest0,address)
+    ).
+
+direct_call(EA,Dest):-
+    arch.call(EA,_),
+    instruction_immediate_offset(EA,_,_,_),
+    instruction_has_relocation(EA,Rel),
+    relocation(Rel,_,_,_,SymbolIndex,_,_),
+    relocation_active_symbol_table(SymbolTable),
+    defined_symbol(Dest0,_,_,_,_,_,SymbolTable,SymbolIndex,_),
+    instruction_get_operation(EA,Operation),
+    (
+        contains("X",Operation),
+        (
+            (EA band 1) = 0, Dest = as(Dest0+1,address);
+            (EA band 1) = 1, Dest = as(Dest0-1,address)
+        )
+        ;
+        !contains("X",Operation),
+        Dest = as(Dest0,address)
+    ).
+
+/**
+Either movw r, #N or movt r, #N
+*/
+.decl movw_movt(EA:address,Reg:register,Val:number,Operation:symbol)
+
+movw_movt(EA,Reg,Val,Operation):-
+    instruction(EA,_,_,Operation,ImmOp,RegOp,0,_,_,_),
+    op_regdirect_contains_reg(RegOp,Reg),
+    op_immediate(ImmOp,Val),
+    (Operation = "MOVW"; Operation = "MOVT").
+
+/**
+E.g., EA_movw: movw reg, N
+      EA_movt: movt reg, M
+   => reg's Value = N | (M << 16)
+*/
+.decl movw_movt_pair(EA_movw:address,EA_movt:address,Value:number)
+
+movw_movt_pair(EA_movw,EA_movt,Value):-
+    instruction_get_operation(EA_movw,"MOVW"),
+    // Given a movw, try to find the corresponding movt up to 3 instructions.
+    (
+        next(EA_movw,EA_movt)
+        ;
+        next(EA_movw,EA_temp),
+        next(EA_temp,EA_movt),
+        !movw_movt(EA_temp,Reg,_,"MOVW")
+        ;
+        next(EA_movw,EA_temp1),
+        next(EA_temp1,EA_temp2),
+        next(EA_temp2,EA_movt),
+        !movw_movt(EA_temp1,Reg,_,"MOVW"),
+        !movw_movt(EA_temp2,Reg,_,"MOVW")
+    ),
+    movw_movt(EA_movw,Reg,Low,"MOVW"),
+    movw_movt(EA_movt,Reg,High,"MOVT"),
+    Value = (High*2^16) bor Low.
+
+/**
+E.g.,
+  add ip, pc, #0, #12
+  add ip, ip, #16, #20
+  ldr pc, [ip, #2640]
+*/
+plt_entry(EA,Function):-
+    plt_entry_arm_candidate(EA,_,Function,_).
+
+/**
+E.g.,
+  bx pc // thumb
+  b.n XXX or nop // thumb
+  add ip, pc, #0, #12
+  add ip, ip, #16, #20
+  ldr pc, [ip, #2640]
+*/
+.decl plt_bx_pc(EA:address,Function:symbol)
+
+plt_bx_pc(EA-3,Function):-
+    plt_entry_arm_candidate(EA,_,Function,_),
+    instruction_get_operation(EA-3,Operation2), // thumb
+    arch.jump_operation_op_index(Operation2,TargetOpIndex),
+    instruction_get_op(EA-3,TargetOpIndex,TargetOp),
+    op_regdirect_contains_reg(TargetOp,PC),
+    arch.pc_reg(PC).
+
+plt_block(EA,Function):-
+    plt_bx_pc(EA,Function).
+
+/**
+EA_entry: The address of the PLT entry
+EA_jump:  The address of the last jump instruction in the PLT entry
+Function: The external function that the PLT entry forwards
+EA_reloc: The destination address of the PLT entry
+*/
+.decl plt_entry_arm_candidate(EA_entry:address, EA_jump:address, Function:symbol, EA_reloc:address)
+
+/**
+E.g.,
+  add ip, pc, #0, #12
+  add ip, ip, #16, #20   or   add ip, ip, #N
+  ldr pc, [ip, #2640]
+*/
+plt_entry_arm_candidate(EA,EA_jump,Function,as(Dest,address)):-
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+
+    arch.pc_reg(PC),
+
+    // add ip, pc, #0, #12
+    arch.reg_arithmetic_operation(EA,Reg,PC,1,N1),
+    next(EA, NextEA),
+
+    // add ip, ip, #16, #20
+    // or
+    // add ip, ip, #XXXX
+    arch.reg_arithmetic_operation(NextEA,Reg,Reg,1,N2),
+    next(NextEA, EA_jump),
+
+    // ldr pc, [ip, #N]
+    instruction_get_operation(EA_jump,Operation),
+    arch.load_operation(Operation),
+    instruction_get_src_op(EA_jump,_,OffsetOp),
+    op_indirect_mapped(OffsetOp,"NONE",Reg,"NONE",_,Offset,_),
+    instruction_get_dest_op(EA_jump,_,RegOp),
+    op_regdirect_contains_reg(RegOp,PC),
+
+    Dest = as(EA,number) + N1 + N2 + Offset + 8,
+    relocation(as(Dest,address),_,Function,_,_,_,_).
+
+/**
+E.g.,
+  movw ip, #N1
+  movt ip, #N2
+  add ip, pc
+  ldr.w pc, [ip, #Offset]
+*/
+plt_entry_arm_candidate(EA,EA_jump,Function,as(Dest,address)):-
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+
+    arch.pc_reg(PC),
+
+    movw_movt_pair(EA,EA_movt,Value),
+
+    // add ip, pc
+    next(EA_movt, EA_add),
+    arch.reg_reg_arithmetic_operation(EA_add,Reg,PC,Reg,1,0),
+
+    // ldr.w pc, [ip, #Offset]
+    next(EA_add, EA_jump),
+    instruction_get_operation(EA_jump,Operation),
+    arch.load_operation(Operation),
+    instruction_get_src_op(EA_jump,_,OffsetOp),
+    op_indirect_mapped(OffsetOp,"NONE",Reg,"NONE",_,Offset,_),
+    instruction_get_dest_op(EA_jump,_,RegOp),
+    op_regdirect_contains_reg(RegOp,PC),
+
+    // What about Offset? It seems irrelevant.
+    Offset = Offset,
+    Dest = as(EA_add,number) - 1 + Value,
+    relocation(as(Dest,address),_,Function,_,_,_,_).
+
+/**
+In case of movw/movt pair, which is basically a bitwise OR of two immediates,
+the destination address needs to be properly set.
+*/
+may_have_symbolic_immediate(Src,Dest):-
+     binary_type("EXEC"),
+     (
+         instruction_get_operation(Src,Operation),
+         !arch.logic_operation(Operation),
+         Operation != "MOVW",
+         Operation != "MOVT",
+         instruction_immediate_offset(Src,Index,_,_),
+         instruction_get_op(Src,Index,Op),
+         op_immediate(Op,Imm),
+         Dest = as(Imm,address)
+         ;
+         movw_movt_pair(Src,_,Value),
+         Dest = as(Value,address)
+     ).
+
+/**
+This rule is shared by `init_symbol_minus_symbol_candidate_arm` and
+`cinf_symbol_minus_symbol_candidate_arm`.
+*/
+.decl symbol_minus_symbol_candidate_arm(EA:address,Size:unsigned,Symbol1:address,Symbol2:address,Scale:unsigned,Offset:number) inline
+
+symbol_minus_symbol_candidate_arm(Addr,Size,EA_add_pc,Dest,Scale,Offset):-
+    arch.pc_relative_disp(EA_add_pc,Disp),
+    data_word(Addr,Size,Diff),
+    Mode = EA_add_pc band 1,
+    Offset = -1 * Disp,
+    (
+        !relocation(Addr,_,_,_,_,_,_),
+        Dest = EA_add_pc + as(Disp + Diff,address) - Mode
+        ;
+        relocation(Addr,"REL32",Symbol,_,SymbolIndex,_,"REL"),
+        symbol(Base,_,_,_,_,_,_,SymbolIndex,Symbol),
+        // ((S + A) | T) - P
+        S = as(Base,unsigned),
+        A = as(Diff,unsigned),
+        P = as(Addr,unsigned),
+        T = as(Base band 1,unsigned),
+        Value = ((S + A) bor T) - P,
+        Dest = (EA_add_pc + as(Disp,address) - Mode) + as(Value,address)
+    ),
+    Scale = 1.
+
+/**
+Represents the first entry of an ARM jump table.
+
+Attributes:
+
+* EA_access: address of instruction that accesses the jump table entries
+* EA_jump: address of jump instruction
+* RegIndex: register used for indexing into the jumptable. May be "NONE" if the index reg is pre-multiplied.
+* Reference: relative base for offsets (if the Type is rel_*, 0 otherwise)
+* TableStart: address of first table entry
+* EntrySize: size of entries
+* Type: "absolute", "rel_signed", or "rel_unsigned"
+* Offset: "1" if the jump table pattern requires "+1" for symbol-symbol Thumb targets in symbolic expression
+*/
+.decl arm_jump_table_candidate_start(EA_access:address,EA_jump:address,RegIndex:reg_nullable,Reference:address,TableStart:address,EntrySize:unsigned,Type:symbol,Scale:unsigned,Offset:number)
+
+/**
+Represents an entry in an ARM jump table.
+
+Attributes:
+
+* EA_jump: address of jump instruction
+* Reference: relative base for offsets (if the Type is rel_*, 0 otherwise)
+* TableStart: address of first table entry
+* EntryAddr: address of table entry
+* EntrySize: size of entries
+* TargetAddr: resolved target of the jump
+* TableLimit: first address that cannot be part of the jump table
+* Type: "absolute", "rel_signed", or "rel_unsigned"
+*/
+.decl arm_jump_table_candidate(EA_jump:address,Reference:address,TableStart:address,EntryAddr:address,EntrySize:unsigned,TargetAddr:address,TableLimit:address,Type:symbol,Scale:unsigned)
+
+/**
+Addresses at which jump table data blocks should be split
+*/
+.decl arm_jump_table_data_block_limit(EA_jmp:address,TableStart:address,Limit:address)
+
+/**
+Instruction at address `EA` accesses a literal pool located at `LitPoolAddr`
+
+EA:     EA of the instruction containing the literal-pool label.
+        Note that for ADR/LDR case, EA is the address of ADR.
+        For other cases, EA is the address of the load instruction.
+EA_ldr: EA of the load instruction that actually accesses the literal pool
+        EA = EA_ldr for non-ADR/LDR case
+RefAddr: The address of referenced label
+Offset: This is for handling the ADR/LDR case:
+          adr BaseReg, Label
+          ldr Reg, [BaseReg, Offset]
+        For other cases, Offset is 0.
+        The actual literal pool address would be `RefAddr + Offset`.
+Size:   The whole size of the literal pool entry accessed by the instruction
+        at EA_ldr:
+        E.g., 1 for LDRB
+              2 for LDRH
+              4 for LDR
+              8 for LDRD
+              8 for VLDR
+              N*4 for LDM R, {R1,...,RN}
+OpIndex: The index of operand for literal-pool label.
+        E.g., 1 for LDR, 2 for LDRD, 1 for ADR
+*/
+.decl litpool_ref(EA:address, EA_ldr:address, RefAddr:address, Offset:unsigned, Size:unsigned, OpIndex:operand_index)

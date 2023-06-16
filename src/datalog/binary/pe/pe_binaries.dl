@@ -1,0 +1,196 @@
+//===- pe_binaries.dl ---------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+
+#include "exceptions.dl"
+#include "relocations.dl"
+
+// This module defines predicates specific of PE binaries
+
+.decl pe_data_directory(Type:symbol,Address:address,Size:unsigned)
+.input pe_data_directory
+
+.decl pe_import_entry(Address:address,Ordinal:number,Function:symbol,Library:symbol)
+.input pe_import_entry
+
+.decl pe_export_entry(Address:address,Ordinal:number,Name:symbol)
+.input pe_export_entry
+
+.decl pe_debug_data(Type:symbol,Address:address,Size:unsigned)
+.input pe_debug_data
+
+.decl pe_load_config(Name:symbol,Value:unsigned)
+.input pe_load_config
+.output pe_load_config
+
+/**
+Table maps PE section attribute names to a bitflag.
+*/
+.decl pe_section_characteristics(Name:symbol,Mask:unsigned)
+
+pe_section_characteristics("IMAGE_SCN_TYPE_NO_PAD",0x00000008).
+pe_section_characteristics("IMAGE_SCN_CNT_CODE",0x00000020).
+pe_section_characteristics("IMAGE_SCN_CNT_INITIALIZED_DATA",0x00000040).
+pe_section_characteristics("IMAGE_SCN_CNT_UNINITIALIZED_DATA",0x00000080).
+pe_section_characteristics("IMAGE_SCN_LNK_OTHER",0x00000100).
+pe_section_characteristics("IMAGE_SCN_LNK_INFO",0x00000200).
+pe_section_characteristics("IMAGE_SCN_LNK_REMOVE",0x00000800).
+pe_section_characteristics("IMAGE_SCN_LNK_COMDAT",0x00001000).
+pe_section_characteristics("IMAGE_SCN_GPREL",0x00008000).
+pe_section_characteristics("IMAGE_SCN_MEM_PURGEABLE",0x00020000).
+pe_section_characteristics("IMAGE_SCN_MEM_16BIT",0x00020000).
+pe_section_characteristics("IMAGE_SCN_MEM_LOCKED",0x00040000).
+pe_section_characteristics("IMAGE_SCN_MEM_PRELOAD",0x00080000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_1BYTES",0x00100000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_2BYTES",0x00200000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_4BYTES",0x00300000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_8BYTES",0x00400000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_16BYTES",0x00500000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_32BYTES",0x00600000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_64BYTES",0x00700000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_128BYTES",0x00800000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_256BYTES",0x00900000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_512BYTES",0x00A00000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_1024BYTES",0x00B00000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_2048BYTES",0x00C00000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_4096BYTES",0x00D00000).
+pe_section_characteristics("IMAGE_SCN_ALIGN_8192BYTES",0x00E00000).
+pe_section_characteristics("IMAGE_SCN_LNK_NRELOC_OVFL",0x01000000).
+pe_section_characteristics("IMAGE_SCN_MEM_DISCARDABLE",0x02000000).
+pe_section_characteristics("IMAGE_SCN_MEM_NOT_CACHED",0x04000000).
+pe_section_characteristics("IMAGE_SCN_MEM_NOT_PAGED",0x08000000).
+pe_section_characteristics("IMAGE_SCN_MEM_SHARED",0x10000000).
+pe_section_characteristics("IMAGE_SCN_MEM_EXECUTE",0x20000000).
+pe_section_characteristics("IMAGE_SCN_MEM_READ",0x40000000).
+pe_section_characteristics("IMAGE_SCN_MEM_WRITE",0x80000000).
+
+data_section(Section):-
+    binary_format("PE"),
+    section_property(Section,"Loaded"),
+    section_property(Section,"Initialized"),
+    !section_property(Section,"Executable").
+
+bss_section(Section),
+data_section(Section):-
+    binary_format("PE"),
+    section_property(Section,"Loaded"),
+    !section_property(Section,"Initialized"),
+    !section_property(Section,"Executable").
+
+data_region(Begin,Size):-
+    pe_data_directory(_,Begin,Size), Size > 0;
+    pe_debug_data(_,Begin,Size), Size > 0.
+
+// Implicit page for KUSER_SHARED_DATA
+data_segment(0x7FFE0000,0x7FFE1000):-
+    binary_format("PE").
+
+// Implicit data region for the PE header and optional header.
+data_segment(ImageBase,ImageBase+1024):-
+    binary_format("PE"),
+    base_address(ImageBase).
+
+// Entries of external libraries
+symbol(0,0,"NONE","EXTERN","DEFAULT",0,"none",0,Function):-
+    pe_import_entry(_,_,Function,_).
+
+symbol(EA,0,"NOTYPE","GLOBAL","DEFAULT",0,"export",as(Ordinal,unsigned),Function):-
+    pe_export_entry(EA,Ordinal,Function).
+
+is_padding(EA):-
+    binary_format("PE"),
+    instruction_get_operation(EA,"INT3").
+
+/**
+Non-destructive multi-byte NOPs used by the MSVC compiler. (See `listing.inc'.)
+*/
+.decl npad(EA:address,Size:unsigned)
+
+// mov edi, edi
+npad(EA,Size):-
+    instruction(EA,Size,_,"MOV",Op,Op,_,_,_,_),
+    op_regdirect(Op,"EDI"),
+    Size = 2.
+
+// jmp .+N; .npad N
+npad(EA,Size):-
+    unconditional_jump(EA),
+    direct_jump(EA,Dest),
+    Size = Dest - EA,
+    Size <= 15,
+    npad(EA+2,_).
+
+is_padding(EA):-
+    binary_format("PE"),
+    npad(EA,_).
+
+.decl merged_data_region(Start:address,End:address)
+
+merged_data_region(DataStart,DataStart+DataSize):-
+    binary_format("PE"),
+    !loaded_section(_,_,".rdata"),
+    (
+        pe_data_directory(_,DataStart,DataSize), DataSize > 0;
+        pe_debug_data(_,DataStart,DataSize), DataSize > 0
+    ),
+    entry_point(Entry),
+    DataStart < Entry,
+    loaded_section(SectionStart,SectionEnd,".text"),
+    DataStart > SectionStart,
+    DataStart < SectionEnd.
+
+data_region(Start,Size):-
+    Last = max End:{merged_data_region(_,End)},
+    loaded_section(Start,_,".text"),
+    Size = Last - Start.
+
+/**
+Jump table start pattern where the TableStart is moved through padding.
+*/
+.decl padded_rel_addr_start(EA:address,OpIndex:operand_index,TableStart:address,Offset:number,Dest1:address,Dest2:address) inline
+
+// jmp dword ptr [REG*4 + TableStart - Mult]
+padded_rel_addr_start(EA,OpIndex,TableStart,Offset,Dest1,Dest2):-
+    indirect_jump(EA),
+    instruction_get_op(EA,OpIndex,Op),
+    // Table starts at Offset+Mult.
+    op_indirect(Op,"NONE","NONE",_,Mult,Offset,_),
+    Size = as(Mult,unsigned),
+    // If the first entry seems dummy, move TableStart forward by Mult.
+    // E.g., windirstat
+    // 437c71:   jmp DWORD PTR [EAX*4+4422780]
+    // 437c78:   ...
+    // 437c7f: BYTE 090H
+    // 437c80: DWORD $L_437c8c
+    // 437c84: DWORD $L_437cb0
+    // 437c88: DWORD $L_437cd8
+    !address_in_data(as(Offset,address),_),
+    TableStart = as(Offset+Mult,address),
+    // Table entry is the complete Dest address.
+    data_word(TableStart,Size,TableEntry),
+    Dest1 = as(TableEntry,address),
+    arch.pointer_size(Pt_size), Pt_size = Size,
+    // Check on the second entry as well.
+    // This is based on the assumption that a jump-table consists of
+    // multiple entries.
+    data_word(TableStart+Size,Size,TableEntry2),
+    Dest2 = as(TableEntry2,address).

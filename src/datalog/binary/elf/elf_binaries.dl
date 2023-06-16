@@ -1,0 +1,326 @@
+//===- elf_binaries.dl --------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+/**
+This module defines predicates and rules specific of ELF binaries
+*/
+
+.decl elf_section_type(Name:symbol,Code:unsigned)
+
+elf_section_type("NULL",0).
+elf_section_type("PROGBITS",1).
+elf_section_type("SYMTAB",2).
+elf_section_type("STRTAB",3).
+elf_section_type("RELA",4).
+elf_section_type("HASH",5).
+elf_section_type("DYNAMIC",6).
+elf_section_type("NOTE",7).
+elf_section_type("NOBITS",8).
+elf_section_type("REL",9).
+elf_section_type("SHLIB",10).
+elf_section_type("DYNSYM",11).
+
+elf_section_type("INIT_ARRAY",14).
+elf_section_type("FINI_ARRAY",15).
+elf_section_type("PREINIT_ARRAY",16).
+elf_section_type("GROUP",17).
+elf_section_type("SYMTAB_SHNDX",18).
+elf_section_type("NUM",19).
+
+data_section(Name):-
+    section_property(Name,"Loaded"),
+    !section_property(Name,"Executable"),
+    section_type(Name,Type),
+    (   elf_section_type("PROGBITS",Type);
+        elf_section_type("NOBITS",Type);
+        elf_section_type("NOTE",Type);
+        elf_section_type("INIT_ARRAY",Type);
+        elf_section_type("FINI_ARRAY",Type);
+        elf_section_type("PREINIT_ARRAY",Type);
+        elf_section_type("DYNAMIC",Type);
+        elf_section_type("RELA",Type)
+    ).
+
+exception_section(".eh_frame").
+exception_section(".eh_frame_hdr").
+exception_section(".gcc_except_table").
+
+special_data_section(Section):-
+    exception_section(Section).
+
+special_data_section(".dynamic").
+special_data_section(".fini_array").
+special_data_section(".got").
+special_data_section(".got.plt").
+special_data_section(".init_array").
+special_data_section(".interp").
+special_data_section(".jcr").
+special_data_section(".tm_clone_table").
+
+/**
+ELF section types that contain an array of code pointers.
+*/
+.decl elf_pointer_array_section_type(SectionTypeName:symbol)
+
+elf_pointer_array_section_type("INIT_ARRAY").
+elf_pointer_array_section_type("PREINIT_ARRAY").
+elf_pointer_array_section_type("FINI_ARRAY").
+
+function_pointer_section(SectionName):-
+    binary_format("ELF"),
+    elf_pointer_array_section_type(SectionTypeName),
+    elf_section_type(SectionTypeName,SectionType),
+    section_type(SectionName,SectionType).
+
+function_pointer_section(".got.plt"):-
+    binary_format("ELF").
+
+////////////////////////////////////////////////////////////////////////////
+// detect references  to libraries (calls to plt)
+.decl plt_section(name:symbol)
+
+plt_section(".plt").
+plt_section(".plt.got").
+plt_section(".plt.sec").
+
+.decl got_section(name:symbol)
+
+got_section(".got").
+got_section(".got.plt").
+
+bss_section(Name):-
+    binary_format("ELF"),
+    section_property(Name,"Loaded"),
+    !section_property(Name,"Initialized").
+
+non_zero_data_section(Name):-
+    data_section(Name),
+    !bss_section(Name),
+    Name != ".dynamic".
+
+////////////////////////////////////////////////////////////////////////////
+// detect references  to libraries (calls to plt)
+
+.decl plt_entry(ea:address, function:symbol)
+
+plt_entry(EA,Function):-
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+    pc_relative_jump(EA,Got_entry),
+    relocation(Got_entry,_,Function,_,_,_,_),
+    Function != "".
+
+plt_entry(EA,Name):-
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+    pc_relative_jump(EA,Got_entry),
+    relocation(Got_entry,"IRELATIVE","",Dest,_,_,_),
+    best_ifunc_symbol(as(Dest,address),Name).
+
+plt_block(Block,Function):-
+    plt_entry(EA,Function),
+    code_in_block(EA,Block).
+
+// If a block in the PLT section must fallthrough to another block in the
+// PLT, consider it to be a PLT block for Function.
+plt_block(Block,Function):-
+    plt_block(NextBlock,Function),
+    must_fallthrough(EA,NextBlock),
+    code_in_block(EA,Block),
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    Block >= Beg,
+    EA < End.
+
+.decl get_pc_thunk(EA:address,Reg:register)
+
+// call    __x86.get_pc_thunk.REG
+// ...
+// __x86.get_pc_thunk.REG:
+// mov     REG, DWORD PTR [esp]
+// ret
+get_pc_thunk(EA,Reg):-
+    binary_isa("X86"),
+    binary_format("ELF"),
+    direct_call(_,EA),
+    instruction(EA,Size,_,Operation,Op1,Op2,_,_,_,_),
+    arch.move_operation(Operation),
+    op_regdirect_contains_reg(Op2,Reg),
+    op_indirect_mapped(Op1,"NONE","ESP","NONE",1,0,_),
+    arch.return(EA+Size).
+
+no_return_function("abort(@.*)?"):- binary_format("ELF").
+no_return_function("_?exit(@.*)?"):- binary_format("ELF").
+no_return_function("__chk_fail(@.*)?"):- binary_format("ELF").
+no_return_function("__stack_chk_fail(@.*)?"):- binary_format("ELF").
+no_return_function("__assert_fail(@.*)?"):- binary_format("ELF").
+no_return_function("longjmp(@.*)?"):- binary_format("ELF").
+no_return_function("__clang_call_terminate"):- binary_format("ELF").
+
+////////////////////////////////////////////////////////////////////////////
+// exception inputs
+
+/**
+A CIE can be associated to multiple FDEs and it contains information common to all
+of them. 'CieAddr' uniquely identifies the CIE.
+*/
+.decl cie_entry(CieAddr: address,Length:unsigned,CodeAlignmentFactor:unsigned,DataAlignmentFactor:number)
+.input cie_entry
+
+/**
+`cie_encoding` complements `cie_entry` and defines the encodings of the pointers in the FDEs and in the
+LSDAs associated to this CIE.
+*/
+.decl cie_encoding(CieAddr: address,FdeEncoding:unsigned,LsdaEncoding:unsigned)
+.input cie_encoding
+
+/**
+The personality routine associated to a CIE entry. This is the procedure that takes care of unwinding
+the stack and exceptions. For C++ it is typically: '__gxx_personality_v0'.
+*/
+.decl cie_personality(CieAddr:address,Personality:address,PersonalityPos:address,PersonalitySize:unsigned,Encoding:unsigned)
+.input cie_personality
+
+/**
+A FDE entry defines how stack unwinding is done in a region of code from 'start' to 'end'.
+Each FDE points to a parent CIE that contains properties common to multiple FDEs.
+'FdeAddr' and 'Length' determine the location of the FDE entry in the eh_frame section.
+A FDE entry can have 'Lsda' associated that contains exception handling information.
+*/
+.decl fde_entry(FdeAddr: address,Length:unsigned,Cie:address,Start:address,End:address,Lsda:address)
+.input fde_entry
+
+/**
+Ancillary predicate that specifies the actual locations of the symbolic expressions
+in the FDE entry.
+*/
+.decl fde_pointer_locations(addr:address,startLocation:address,endLocation:address,
+                            endSize:unsigned,lsdaLocation:address,lsdaSize:unsigned)
+.input fde_pointer_locations
+
+/**
+The instructions for stack unwinding are encoded into a dwarf program
+formed by a list of instructions. Each FDE corresponds to a region
+in the code and it has its own program. This predicate captures
+one instruction in that program.
+
+- FdeAddr is the address of the FDE and indentifies it uniquely.
+- Index identifies the instruction within the FDE uniquely.
+- Size is the size of the instruction in bytes.
+- InsnAddr is the address where the instruction is located
+- Insn is the actual opcode of the instruction
+- Op1 and Op2 are the operands of the instruction.
+
+*/
+.decl fde_instruction(FdeAddr:address,Index:unsigned,Size:unsigned,InsnAddr:address,Insn:symbol,Op1:number,Op2:number)
+.input fde_instruction
+
+/**
+A LSDA defines the exception information of a region of code (typically a procedure).
+This is located in section '.gcc_except_table'. A LSDA entry contains two main elements
+a callsite table (see `lsda_callsite`) and a type table (see `lsda_type_entry`).
+*/
+.decl lsda(lsdaAddress:address,callsiteTable:address,callsiteTableEncoding:unsigned,callSiteTableLength:unsigned,
+           typeTable:address,typeTableEncoding:unsigned,landingPadBaseAddress: address)
+.input lsda
+
+/**
+Complementary predicate with the locations of the various pointers in a LSDA used for symbolization.
+*/
+.decl lsda_pointer_locations(lsdaAddress:address,typeTablePointerLocation:address,callsiteTablePointerLoc:address)
+.input lsda_pointer_locations
+
+/**
+The range [Start,End) corresponds to the try block
+and 'LandingPad' to the location where the catch block is located.
+'EA_start', 'EA_end' and 'EA_landingPad' a the locations of the symbolic expressions
+in the .gcc_except_table that point to 'Start', 'End' and 'LandingPad' respectively.
+*/
+.decl lsda_callsite(CallSiteTable_address:address,EA_start:address,Start:address,
+    EA_end:address,End:address,
+    EA_landingPad:address,LandingPad:address,EA_endLandindPad:address)
+.input lsda_callsite
+
+/**
+The exception handling mechanism chooses which catch block catches an given exception
+based on the type of the exception. This is done by having references to the types
+which are encoded in the type table.
+A `lsda_type_entry` is an entry in the type table. The "type" is represented as a
+symbolic expression pointing to 'address'.
+*/
+.decl lsda_type_entry(lsdaTypeTableAddress:address,index:unsigned,address:address)
+.input lsda_type_entry
+
+/**
+Address where a function starts according to the ARM exidx table.
+
+This address does not set the low bit for Thumb functions.
+*/
+.decl arm_exidx_entry(FunctionStart:address,CantUnwind:unsigned)
+.input arm_exidx_entry
+
+////////////////////////////////////////////////////////////////////////////
+// basic exception processing
+
+.decl fde_addresses(start:address, end:address)
+
+fde_addresses(Start,End):-
+    fde_entry(_,_,_,Start,End,_).
+
+/**
+FDE start points can on occasion be misaligned with the actual start
+of the function. This has been seen on glibc restore_rt which generates
+code as follows:
+
+.text
+.align 16
+__restore_rt:
+    movl $15, %rax
+    syscall
+*/
+.decl misaligned_fde_start(start:address,start_adjusted:address)
+.output misaligned_fde_start
+
+misaligned_fde_start(Start,StartAligned):-
+    fde_addresses(Start,End),
+    (
+        StartAligned = @functor_aligned(Start,8)
+        ;
+        StartAligned = @functor_aligned(Start,16)
+    ),
+    StartAligned > Start,
+    function_symbol(StartAligned,_),
+    StartAligned < End.
+
+.decl lsda_callsite_addresses(Start:address,End:address,LandingPad:address)
+
+lsda_callsite_addresses(Start,End,LandingPad):-
+    lsda_callsite(_,_,Start,_,End,_,LandingPad,_).
+
+.decl special_encoding(Code:unsigned,Name:symbol)
+
+special_encoding(1,"uleb128").
+special_encoding(9,"sleb128").

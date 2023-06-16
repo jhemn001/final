@@ -1,0 +1,1 @@
+/usr/bin/clang    -static -Wl,--allow-multiple-definition -z execstack -z norelro CMakeFiles/CADET_00001.dir/lib/libc.c.o CMakeFiles/CADET_00001.dir/src/service.c.o  -o CADET_00001 ../../include/libcgc.a ../../include/tiny-AES128-C/libtiny-AES128-C.a 

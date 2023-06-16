@@ -1,0 +1,1 @@
+/usr/bin/clang    -static -Wl,--allow-multiple-definition -z execstack -z norelro CMakeFiles/greeter.dir/lib/adler32.c.o CMakeFiles/greeter.dir/lib/libc.c.o CMakeFiles/greeter.dir/lib/malloc.c.o CMakeFiles/greeter.dir/lib/md5.c.o CMakeFiles/greeter.dir/src/service.c.o  -o greeter ../../include/libcgc.a ../../include/tiny-AES128-C/libtiny-AES128-C.a 

@@ -1,0 +1,157 @@
+platform: Windows
+
+default: &default
+  path: examples
+  binary: ex.exe
+  arch: x86
+
+  # Compilation configuration.
+  build: &default-build
+    c: ["cl"]
+    cpp: ["cl"]
+    optimizations: ["/Od", "/Ot", "/O1", "/Ox", "/O2"]
+    flags: []
+
+  # Disassembly configuration.
+  disassemble:
+    flags: ["-F", "--generate-import-libs"]
+
+  # Reassembly configuration.
+  reassemble:
+    compiler: "ml"
+    flags: ["/link", "/subsystem:console", "/entry:_EntryPoint"]
+    skip: false
+
+  # Test configuration.
+  test:
+    wrapper: null
+    strip_exe: "strip-dummy" # We do not apply strip for Windows binaries
+    strip: false
+    skip: false
+
+assembly: &assembly
+  <<: *default
+  path: examples/asm_examples
+
+cpp-exceptions: &cpp-exceptions
+  <<: *default
+
+  build:
+    <<: *default-build
+    flags: ["/EHsc"] # Enable C++ exception handling.
+
+tests:
+    - name: ex1
+      <<: *default
+
+    - name: ex_2modulesPIC
+      <<: *default
+
+    - name: ex_confusing_data
+      <<: *default
+
+    - name: ex_exceptions1
+      <<: *cpp-exceptions
+
+    - name: ex_exceptions2
+      <<: *cpp-exceptions
+
+    - name: ex_exceptions3
+      <<: *cpp-exceptions
+
+    - name: ex_false_pointer_array
+      <<: *default
+
+    - name: ex_float
+      <<: *default
+
+    - name: ex_fprintf
+      <<: *default
+
+    - name: ex_noreturn
+      <<: *default
+
+    - name: ex_pointerReatribution
+      <<: *default
+
+    - name: ex_pointerReatribution2
+      <<: *default
+
+    - name: ex_pointerReatribution3
+      <<: *default
+
+    - name: ex_struct
+      <<: *default
+
+    - name: ex_switch
+      <<: *default
+
+    - name: ex_uninitialized_data
+      <<: *default
+
+    - name: ex_legacy_switch.001
+      <<: *default
+
+    - name: ex_legacy_switch.002
+      <<: *default
+
+    - name: ex_legacy_switch.003
+      <<: *default
+
+    - name: ex_legacy_switch.004
+      <<: *default
+
+    - name: ex_memberPointer
+      <<: *default
+
+    - name: ex_virtualDispatch
+      <<: *default
+
+    - name: ex_simple_dll
+      <<: *default
+
+    - name: ex_ml_sym_mangling
+      <<: *default
+      binary: baz.dll
+      build:
+        c: ["cl"]
+        cpp: ["cl"]
+        optimizations: ["/Od"]
+        flags: []
+      reassemble:
+        compiler: "ml"
+        flags: ["/link", "/DLL", "/ENTRY:_EntryPoint", "/SUBSYSTEM:console"]
+        skip: false
+
+    - name: ex1
+      <<: *default
+      build:
+        <<: *default-build
+        flags: ["/link", "/merge:.rdata=.text"]
+
+    - name: ex_seh
+      <<: *default
+      build:
+        <<: *default-build
+        flags: ["/link", "/safeseh:no"]
+
+    - name: ex_seh
+      <<: *default
+      build:
+        <<: *default-build
+        flags: ["/link", "/safeseh"]
+
+    # TODO:
+    # - name: ex_thread_local
+    #   <<: *default
+
+    # TODO:
+    # - name: ex_threads
+    #   <<: *default
+
+    # TODO:
+    # - name: ex_call_once
+    #   <<: *default
+
+    - name: ex_kuser
+      <<: *default

@@ -1,0 +1,26 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../challenges/CADET_00001/lib/libc.h
+
+../include/libcgc.h
+
+/cb-multios/challenges/CADET_00001/lib/libc.c
+libcgc.h
+-
+libc.h
+/cb-multios/challenges/CADET_00001/lib/libc.h
+
+/cb-multios/challenges/CADET_00001/lib/libc.h
+
+/cb-multios/challenges/CADET_00001/src/service.c
+libcgc.h
+-
+libc.h
+/cb-multios/challenges/CADET_00001/src/libc.h
+

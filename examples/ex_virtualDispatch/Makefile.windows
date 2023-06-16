@@ -1,0 +1,10 @@
+CFLAGS="/Fa"
+
+all: ex.cpp
+	cl /nologo $(CFLAGS) ex.cpp
+	@ ex > out.txt
+clean:
+	del /F /Q *.exe *.obj *.exp *.def *.lib *.s out.txt check.txt mllink$$.lnk
+check:
+	@ ex >check.txt
+	@ FC out.txt check.txt && echo TEST OK

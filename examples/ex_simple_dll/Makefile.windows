@@ -1,0 +1,17 @@
+CFLAGS = "/Fa"
+
+all: dll
+	$(CC) ex.c test.lib
+	@ ex > out.txt
+dll: test.h test.c
+	@ $(CC) $(CFLAGS) /LD test.c
+clean:
+	del /F /Q *.exe *.dll *.obj *.exp *.def *.lib *.s out.txt check.txt mllink$$.lnk
+check:
+	@ ex > check.txt
+	@ FC out.txt check.txt && echo TEST OK
+reassemble:
+	@ $(AS) $(ASFLAGS) /c test.dll.s
+	@ lib.exe /subsystem:console /def /export:message test.dll.obj
+	@ link.exe /subsystem:console /entry:__EntryPoint /dll test.dll.obj test.dll.exp
+	@ link.exe /out:ex.exe /subsystem:console ex.obj test.dll.lib

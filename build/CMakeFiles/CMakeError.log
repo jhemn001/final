@@ -1,0 +1,23 @@
+Performing C++ SOURCE FILE Test USING_LIBCPP failed with the following output:
+Change Dir: /home/po/ddisasm-main/build/CMakeFiles/CMakeTmp
+
+Run Build Command(s):/usr/bin/gmake -f Makefile cmTC_5c42f/fast && /usr/bin/gmake  -f CMakeFiles/cmTC_5c42f.dir/build.make CMakeFiles/cmTC_5c42f.dir/build
+gmake[1]: Entering directory '/home/po/ddisasm-main/build/CMakeFiles/CMakeTmp'
+Building CXX object CMakeFiles/cmTC_5c42f.dir/src.cxx.o
+/usr/bin/c++ -DUSING_LIBCPP  -std=c++17 -o CMakeFiles/cmTC_5c42f.dir/src.cxx.o -c /home/po/ddisasm-main/build/CMakeFiles/CMakeTmp/src.cxx
+/home/po/ddisasm-main/build/CMakeFiles/CMakeTmp/src.cxx: In function ‘int main()’:
+/home/po/ddisasm-main/build/CMakeFiles/CMakeTmp/src.cxx:4:12: error: ‘_LIBCPP_VERSION’ was not declared in this scope
+    4 |     return _LIBCPP_VERSION;
+      |            ^~~~~~~~~~~~~~~
+gmake[1]: *** [CMakeFiles/cmTC_5c42f.dir/build.make:78: CMakeFiles/cmTC_5c42f.dir/src.cxx.o] Error 1
+gmake[1]: Leaving directory '/home/po/ddisasm-main/build/CMakeFiles/CMakeTmp'
+gmake: *** [Makefile:127: cmTC_5c42f/fast] Error 2
+
+
+Source file was:
+
+  #include <ciso646>
+  int main() {
+    return _LIBCPP_VERSION;
+  }
+

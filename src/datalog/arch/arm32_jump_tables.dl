@@ -1,0 +1,368 @@
+//===- arm32_jump_tables.dl ------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019-2022 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+/**
+Define a set predicates to detect jump-tables for ARM32
+*/
+
+/**
+Instructions in the same block as the jumptable's jump instruction.
+*/
+.decl arm_jump_table_block_instruction(EA:address,EA_jump:address)
+
+arm_jump_table_block_instruction(EA_jump,EA_jump):-
+    arm_jump_table_candidate_start(_,EA_jump,_,_,_,_,_,_,_).
+
+arm_jump_table_block_instruction(Prev,EA_jump):-
+    arm_jump_table_block_instruction(EA,EA_jump),
+    must_fallthrough(Prev,EA).
+
+/**
+The start of the block containing the jumptable's jump instruction.
+
+Can be used before code_in_block_candidate.
+*/
+.decl arm_jump_table_block_start(Block:address,EA_jump:address)
+
+arm_jump_table_block_start(Block,EA_jump):-
+    arm_jump_table_block_instruction(Block,EA_jump),
+    next(Prev,Block),
+    !arm_jump_table_block_instruction(Prev,EA_jump).
+
+/**
+PC-relative loads using an index register
+*/
+.decl indexed_pc_relative_load(EA:address,DstReg:register,LoadFrom:address,IndexReg:reg_nullable,Size:unsigned)
+
+// Direct pc-rel load: ldr reg, [pc, r2, lsl N]
+indexed_pc_relative_load(EA,DstReg,LoadFrom,IndexReg,Size):-
+    arch.pc_reg(PC),
+    arch.pointer_size(Size),
+    arch.load(EA,_,_,DstReg,PC,IndexReg,Mult,0),
+    Size = as(Mult,unsigned),
+    reg_nonnull(IndexReg,_),
+    arch.pc_relative_disp(EA,Disp),
+    align_addr(AlignedEA,EA),
+    LoadFrom = as(as(AlignedEA,number) + Disp,address).
+
+// pc-rel load:
+//  adr r1, Label   or  add r1, pc, offset
+//  ldr reg, [r1, r2, lsl N]
+indexed_pc_relative_load(EA,DstReg,LoadFrom,IndexReg,Size):-
+    arch.pointer_size(Size),
+    arch.pc_relative_addr(EA_adr,BaseReg,LoadFrom),
+    straight_line_def_used(EA_adr,BaseReg,EA,_),
+    arch.load(EA,_,_,DstReg,BaseReg,IndexReg,as(Size,number),0),
+    reg_nonnull(IndexReg,_).
+
+//              lsl r1, r?, N
+//  EA_adr:     adr r2, Label
+//  EA_ldr:     ldr r1, [r1, r2]
+indexed_pc_relative_load(EA_ldr,DstReg,LoadFrom,"NONE",Size):-
+    arch.pointer_size(Size),
+    arch.pc_relative_addr(EA_adr,BaseReg,LoadFrom),
+    straight_line_def_used(EA_adr,BaseReg,EA_ldr,_),
+    // Because the index register is already multiplied, the index and base
+    // regs are interchangeable
+    // We don't verify that OffsetReg = IndexReg * Size, because sometimes
+    // it's too far away.
+    (
+        arch.load(EA_ldr,_,_,DstReg,BaseReg,OffsetReg,1,0),
+        reg_nonnull(OffsetReg,_)
+        ;
+        arch.load(EA_ldr,_,_,DstReg,_,as(BaseReg,reg_nullable),1,0)
+    ).
+
+/**
+Jump-table pattern
+  [1] ldr pc, [pc, r2, lsl N]
+  [2] adr r1, Label   or  add r1, pc, offset
+      ldr pc, [r1, r2, lsl N]
+*/
+arm_jump_table_candidate_start(EA,EA,IndexReg,TableStart,TableStart,Size,"absolute",1,0):-
+    arch.pc_reg(PC),
+    indexed_pc_relative_load(EA,PC,TableStart,IndexReg,Size).
+
+/**
+Jump-table pattern
+  [3] adr r1, Label   or  add r1, pc, offset
+      ldr r0, [r1, r2, lsl N]
+      mov pc, r0
+*/
+arm_jump_table_candidate_start(EA_ldr,EA_jump,IndexReg,0,TableStart,Size,"absolute",1,0):-
+    indexed_pc_relative_load(EA_ldr,LoadedReg,TableStart,IndexReg,Size),
+    straight_line_def_used(EA_ldr,LoadedReg,EA_jump,_),
+    reg_jump(EA_jump,LoadedReg).
+
+/**
+Specialization of indexed_pc_relative_load, where the result in an arithmetic
+operation indicating a relative jump table.
+*/
+.decl indexed_pc_relative_load_relative(EA:address,DstReg:register,LoadFrom:address,IndexReg:reg_nullable,Size:unsigned,EA_add:address,Reference:address)
+
+// loaded offset added to a register containing pc relative addr
+indexed_pc_relative_load_relative(EA_ldr,DstReg,TableStart,IndexReg,Size,EA_add,Reference):-
+    indexed_pc_relative_load(EA_ldr,LoadedReg,TableStart,IndexReg,Size),
+    straight_line_def_used(EA_ldr,LoadedReg,EA_add,_),
+    arch.reg_reg_arithmetic_operation(EA_add,DstReg,RefReg,LoadedReg,1,0),
+    straight_line_def_used(EA_ref,RefReg,EA_add,_),
+    arch.pc_relative_addr(EA_ref,RefReg,Reference).
+
+// loaded offset added directly to PC
+indexed_pc_relative_load_relative(EA_ldr,DstReg,TableStart,IndexReg,Size,EA_add,Reference):-
+    indexed_pc_relative_load(EA_ldr,LoadedReg,TableStart,IndexReg,Size),
+    straight_line_def_used(EA_ldr,LoadedReg,EA_add,_),
+    arch.pc_reg(PC),
+    arch.reg_reg_arithmetic_operation(EA_add,DstReg,PC,LoadedReg,1,0),
+    arch.pc_relative_disp(EA_add,Disp),
+    Reference = EA_add + as(Disp,address).
+
+/**
+    EA_ldr:  ldr r3, ...
+    EA_add   add r5, r4, r3
+    EA_jump: bx r5
+or
+    EA_ldr:  ldr r3, ...
+    EA_add   add pc, r4, r3
+*/
+arm_jump_table_candidate_start(EA_ldr,EA_jump,IndexReg,Reference,TableStart,Size,"rel_signed",1,Offset):-
+    indexed_pc_relative_load_relative(EA_ldr,JmpReg,TableStart,IndexReg,Size,EA_add,Reference),
+    (
+        // the result register of the add is used as a jump
+        straight_line_def_used(EA_add,JmpReg,EA_jump,_),
+        reg_jump(EA_jump,JmpReg),
+        Offset = 1
+        ;
+        // The add is also a jump, e.g. add pc, r4, r3
+        arch.pc_reg(JmpReg),
+        EA_add = EA_jump,
+        Offset = 0
+    ).
+
+/**
+Thumb jump table instructions "TBB" and "TBH" and their entry sizes.
+*/
+.decl thumb_jumptable_instruction(Operation:symbol,Size:unsigned)
+
+thumb_jumptable_instruction("TBB",1).
+thumb_jumptable_instruction("TBH",2).
+
+arm_jump_table_candidate_start(EA,EA,IndexReg,Reference,TableStart,Size,"rel_unsigned",2,0):-
+    thumb_jumptable_instruction(Operation,Size),
+    instruction(EA,InstrSize,_,Operation,Operand,0,0,0,_,_),
+    op_indirect_mapped(Operand,"NONE",BaseReg,IndexReg0,_,_,_),
+    reg_nonnull(IndexReg0,IndexReg),
+    Reference = as(EA+InstrSize-1,address),
+    (
+        arch.pc_reg(BaseReg),
+        TableStart = Reference
+        ;
+        !arch.pc_reg(BaseReg),
+        straight_line_def_used(EA_ldr,BaseReg,EA,_),
+        arch.pointer_size(PtrSize),
+        litpool_ref(EA_ldr,EA_ldr,LitPoolBase,LitPoolOffset,PtrSize,_),
+        LitPoolAddr = LitPoolBase + LitPoolOffset,
+        data_uword(LitPoolAddr,PtrSize,Value),
+        TableStart = as(Value,address)
+        ;
+        !arch.pc_reg(BaseReg),
+        straight_line_def_used(EA_adr,BaseReg,EA,_),
+        arch.pc_relative_addr(EA_adr,BaseReg,TableStart)
+    ).
+
+/**
+Compute the target address for the given unsigned relative jump-table entry.
+
+Type: Target type ("rel_unsigned", "rel_signed", or "absolute")
+EA: An entry of a relative jump-table
+Thumb: lowest address bit of the jumping instruction
+Reference: The Base from which offsets are relative
+Size: The size of the entry
+Scale: The scale amount is multiplied to the entry value
+AlignedTargetAddr: The computed target address is aligned
+*/
+.decl arm_jump_table_candidate_target(Type:symbol,Thumb:unsigned,EA:address,Reference:address,Size:unsigned,Scale:unsigned,TargetAddr:address) inline
+
+arm_jump_table_candidate_target("absolute",Thumb,EA,Reference,Size,Scale,TargetAddr):-
+    arch.pointer_size(Size),
+    address_in_data(EA,TargetAddr),
+    UNUSED(Thumb),
+    UNUSED(Reference),
+    UNUSED(Scale).
+
+arm_jump_table_candidate_target("rel_unsigned",Thumb,EA,Reference,Size,Scale,TargetAddr):-
+    data_uword(EA,Size,Diff),
+    TargetAddr = (Reference + Diff * Scale) bor Thumb.
+
+arm_jump_table_candidate_target("rel_signed",Thumb,EA,Reference,Size,Scale,TargetAddr):-
+    data_word(EA,Size,Diff),
+    TargetAddr = as(Diff*as(Scale,number)+as(Reference,number),address) bor Thumb.
+
+// base case
+arm_jump_table_candidate(EA_jump,Reference,TableStart,EA,Size,TargetAddr,TableLimit,Type,Scale):-
+    arm_jump_table_candidate_start(_,EA_jump,_,Reference,TableStart,Size,Type,Scale,_),
+    // we try both at TableStart (first entry) and TableStart+Size
+    // sometimes the compiler knows the index is non-zero, and puts padding
+    // in the starting entry. we have observed:
+    // * zero padding in a tbb jump table
+    // * "bpkt #0" as padding in ARM ldr/add in libRSCpuRef.so
+    EA = range(TableStart,TableStart+Size+1,Size),
+    arm_jump_table_candidate_target(Type,EA_jump band 1,EA,Reference,Size,Scale,TargetAddr),
+    arch.instruction_at(AlignedTargetAddr,TargetAddr),
+    instruction(TargetAddr,_,_,_,_,_,_,_,_,_),
+    !invalid(TargetAddr,_),
+    (
+        // Jump to before the jumptable - does not restrict jumptable size.
+        AlignedTargetAddr < TableStart, TableLimit = (2 ^ 32) - 1;
+        // Jump to after the jumptable - sets a hard limit on the jumptable size.
+        AlignedTargetAddr >= TableStart+Size, TableLimit = AlignedTargetAddr
+    ).
+
+// recursive case
+arm_jump_table_candidate(EA_jump,Reference,TableStart,EA,Size,TargetAddr,NewTableLimit,Type,Scale):-
+    arm_jump_table_candidate(EA_jump,Reference,TableStart,LastEA,Size,_,TableLimit,Type,Scale),
+    EA = LastEA + Size,
+    !defined_symbol(EA,_,_,_,_,_,_,_,"$t"),
+    !defined_symbol(EA,_,_,_,_,_,_,_,"$a"),
+    EA < TableLimit,
+    arm_jump_table_candidate_target(Type,EA_jump band 1,EA,Reference,Size,Scale,TargetAddr),
+    arch.instruction_at(AlignedTargetAddr,TargetAddr),
+    instruction(TargetAddr,_,_,_,_,_,_,_,_,_),
+    !invalid(TargetAddr,_),
+    (
+        // The target address is before the table. Does not limit propagation.
+        AlignedTargetAddr < TableStart, NewTableLimit = TableLimit;
+        // The target address points at or beyond this entry.
+        // Constrain the table limit if necesssary.
+        AlignedTargetAddr >= EA+Size, NewTableLimit = min(AlignedTargetAddr, TableLimit)
+    ).
+
+/**
+The value compared against just before entering the jumptable's block.
+
+This is typically the number of jumptable entries, so we use it to create one
+big data block instead of smaller ones. We prefer this if we can identify the
+comparison, because it's a definitive limit on the jumptable size.
+*/
+.decl arm_jump_table_cmp_limit(Jmp:address,TableStart:address,Count:number)
+
+arm_jump_table_cmp_limit(Jmp,TableStart,Immediate+Offset+1):-
+    arm_jump_table_candidate_start(_,Jmp,IndexReg0,_,TableStart,_,_,_,_),
+    reg_nonnull(IndexReg0,IndexReg),
+    arm_jump_table_block_start(Block,Jmp),
+    may_fallthrough(CondJmp,Block),
+    arch.jump(CondJmp),
+    arch.conditional(CondJmp,CC),
+    must_fallthrough(Cmp,CondJmp),
+    cmp_immediate_to_reg(Cmp,IndexReg,_,Immediate),
+    limit_type_map(CC,_,"MAX",_,Offset).
+
+// In some cases, the value is saved to the stack before the branch, and loaded
+// into a different register for use as the index
+// (from arm.ubuntu20.vim.clang.O0.nopie.nostrip.elf):
+//            str r0, [sp, #316]
+//            cmp r0, #181
+//            bhi .L_1fdfbc
+//            ldr r1, [sp, #316]
+//            adr r0, .L_1fb360
+//            ldr r0, [r0, r1, LSL 2]
+//            mov pc, r0
+arm_jump_table_cmp_limit(Jmp,TableStart,Immediate+Offset+1):-
+    arm_jump_table_candidate_start(TableLdr,Jmp,JmpIndexReg0,_,TableStart,_,_,_,_),
+    reg_nonnull(JmpIndexReg0,JmpIndexReg),
+    arm_jump_table_block_start(Block,Jmp),
+    may_fallthrough(CondJmp,Block),
+    arch.jump(CondJmp),
+    arch.conditional(CondJmp,CC),
+    limit_type_map(CC,_,"MAX",_,Offset),
+    must_fallthrough(Cmp,CondJmp),
+    cmp_immediate_to_reg(Cmp,CmpIndexReg,_,Immediate),
+    // JmpIndexReg is loaded from stack
+    straight_line_def_used(IndexLdr,JmpIndexReg,TableLdr,_),
+    arch.load(IndexLdr,_,_,JmpIndexReg,BaseReg,"NONE",_,StackPos),
+    arch.stack_pointer(BaseReg),
+    // CmpIndexReg is stored to the same stack location
+    straight_line_def_used(Def,CmpIndexReg,Cmp,_),
+    straight_line_def_used(Def,CmpIndexReg,Str,_),
+    arch.store(Str,_,_,CmpIndexReg,BaseReg,"NONE",_,StackPos).
+
+// Generate a single block with the cmp-derived limit, if we have one.
+arm_jump_table_data_block_limit(EA_jmp,TableStart,TableStart+as(Count,unsigned)*Size):-
+    arm_jump_table_candidate(EA_jmp,_,TableStart,_,Size,_,_,_,_),
+    arm_jump_table_cmp_limit(EA_jmp,TableStart,Count).
+
+// If we're not using a cmp-derived limit, the last propagated entry is the last limit.
+arm_jump_table_data_block_limit(EA_jmp,TableStart,Limit):-
+    arm_jump_table_candidate(EA_jmp,_,TableStart,EA_last,Size,_,_,_,_),
+    !arm_jump_table_cmp_limit(EA_jmp,TableStart,_),
+    !arm_jump_table_candidate(EA_jmp,_,TableStart,EA_last+Size,Size,_,_,_,_),
+    Limit = EA_last+Size.
+
+// If we're not using a cmp-derived limit, add intermediate limits where
+// overlapping blocks might start: direct jump targets and other jump tables.
+arm_jump_table_data_block_limit(EA_jmp,TableStart,EA):-
+    arm_jump_table_candidate(EA_jmp,_,TableStart,EA,_,_,_,_,_),
+    !arm_jump_table_cmp_limit(EA_jmp,TableStart,_),
+    // Don't generate a limit at TableStart - the jumptable must have at least
+    // one entry.
+    TableStart != EA,
+    arch.instruction_at(EA,Inst),
+    (
+        direct_jump(_,Inst);
+        arm_jump_table_candidate(_,_,_,_,_,Inst,_,_,_)
+    ).
+
+// Another potential jumptable starts at EA
+arm_jump_table_data_block_limit(EA_jmp,TableStart,NextTableStart):-
+    arm_jump_table_candidate(EA_jmp,_,TableStart,NextTableStart,_,_,_,_,_),
+    TableStart != NextTableStart,
+    arm_jump_table_candidate_start(_,_,_,_,NextTableStart,_,_,_,_).
+
+/**
+Generate data block candidates for the jump table entries.
+We try to generate one big block, but split it at any possible jump target.
+This allows the block_points rules to decide whether the conflicts are data
+or code.
+*/
+.decl arm_jump_table_data_block(EA_jmp:address,TableStart:address,Block:address,Size:address)
+
+// First data block - should exist if the jumping block does.
+arm_jump_table_data_block(EA_jmp,TableStart,TableStart,Limit-TableStart):-
+    arm_jump_table_candidate_start(_,EA_jmp,_,_,TableStart,_,_,_,_),
+    Limit = min Limit : {
+        arm_jump_table_data_block_limit(EA_jmp,TableStart,Limit)
+    }.
+
+// Subsequent possible data blocks
+arm_jump_table_data_block(EA_jmp,TableStart,Limit1,Size):-
+    arm_jump_table_data_block_limit(EA_jmp,TableStart,Limit1),
+    Limit2 = min Limit2 : {
+        arm_jump_table_data_block_limit(EA_jmp,TableStart,Limit2),
+        Limit2 > Limit1
+    },
+    Size = Limit2-Limit1.
+
+data_block_candidate(Block,Size):-
+    arm_jump_table_data_block(_,_,Block,Size).
+
+jump_table_candidate(EA,DataEA,DataSize,TargetEA):-
+    arm_jump_table_candidate(EA,_,_,DataEA,DataSize,TargetEA,_,_,_).

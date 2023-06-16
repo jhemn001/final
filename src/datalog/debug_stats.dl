@@ -1,0 +1,83 @@
+//===- debug_stats.dl -----------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+
+// Predicates for debugging and statistics
+.decl discarded_aligned_pointer(ea:address)
+
+.decl discarded_aligned_pointer_to_text(ea:address)
+
+.decl unaligned_pointer(ea:address)
+
+discarded_aligned_pointer_to_text(EA):-
+    aligned_address_in_data(EA,_),
+    !address_in_data_refined(EA,_).
+
+discarded_aligned_pointer(EA):-
+    discarded_data_object(EA,Pt_size,"symbol"),
+    EA % Pt_size = 0.
+
+unaligned_pointer(EA):-
+    data_object(EA,Pt_size,"symbol"),
+    EA % Pt_size != 0.
+
+.decl immediate_symbol(ea:address,op_index:operand_index,dest:address)
+
+immediate_symbol(EA,Op_index,DestAddr):-
+    code(EA),
+    may_have_symbolic_immediate(EA,DestAddr),
+    instruction_get_op(EA,Op_index,Op),
+    !direct_jump(EA,_),
+    !direct_call(EA,_),
+    op_immediate(Op,Dest),
+    DestAddr = as(Dest,address).
+
+.decl missed_jump_table(EA_jump:address)
+.output missed_jump_table
+
+missed_jump_table(EA):-
+    reg_jump(EA,_),
+    code(EA),
+    reg_def_use.def_used(EA_base,Reg,EA,_),
+    arch.reg_reg_arithmetic_operation(EA_base,Reg,Reg,_,_,0),
+    !jump_table_start(EA,_,_,_,_).
+
+missed_jump_table(EA):-
+    reg_call(EA,_),
+    code(EA),
+    reg_def_use.def_used(EA_base,Reg,EA,_),
+    arch.reg_reg_arithmetic_operation(EA_base,Reg,Reg,_,_,0),
+    !jump_table_start(EA,_,_,_,_).
+
+/**
+Relocations that did not turn out to be symbolized, i.e. possible false negatives.
+*/
+.decl missing_relocation_handling(EA:address)
+.output missing_relocation_handling
+
+// Log any unhandled relocations for debugging
+missing_relocation_handling(EA):-
+    relocation(EA,Type,_,_,_,_,_),
+    !symbolic_expr(EA,_,_,_),
+    !got_reference(EA,_),
+    Type != "ABSOLUTE",
+    Type != "COPY".

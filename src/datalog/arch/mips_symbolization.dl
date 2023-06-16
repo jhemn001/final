@@ -1,0 +1,601 @@
+//===- mips_symbolization.dl --------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2020-2023 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+/**
+MIPS architecture-specific rules for symbolization
+*/
+
+// load word from got table: e.g., lw v0, -32696(gp)
+value_reg(EA,Reg,EA,"NONE",0,Val,1):-
+    instruction(EA,_,_,"LW",_,Op2,0,0,_,_),
+    op_regdirect_contains_reg(Op2,Reg),
+    track_register(Reg),
+    gp_relative_operand(EA,1,Offset_addr),
+    data_word(Offset_addr, 4, Val).
+
+// lui reg3, hi(xxx)
+// addiu reg2, reg3, lo(xxx)
+// addu reg, reg2, t9 <--- (A)
+// Get the value of reg at (A)
+// NOTE: This assumes t9 holds the address of the current function, and
+//       lui is the first instruction of the current function.
+// TODO: Find a way of safely getting the function-entry address for t9.
+value_reg_edge(EA,Reg,PrevEA1,Reg,1,as(PrevEA0,number)):-
+    split_load_candidate(PrevEA0, PrevEA1, _, "ADDU"), // check on the idiom
+    next(PrevEA1,EA),
+    instruction_get_operation(EA, "ADDU"),
+    instruction_get_dest_op(EA,_,DestOp),
+    op_regdirect_contains_reg(DestOp,Reg),
+    track_register(Reg).
+
+.decl gp_relative_operand(src:address,index:operand_index, dest:address)
+
+// e.g., lw v0, -32696(gp)
+gp_relative_operand(EA,Index,as(GpValue+Offset,address)):-
+    instruction_get_op(EA, Index, Op),
+    op_indirect(Op,"NONE","GP","NONE",1,Offset,_),
+    reg_def_use.def_used(EA_gp_def,"GP",EA,_),
+    EA_gp_def != EA,
+    value_reg(EA_gp_def,"GP",_,"NONE",_,GpValue,_).
+
+// In case when gp def is not found, use _gp value instead.
+// NOTE: This is a hacky trial:
+// Assume that at load instructions with the source with gp as base register,
+// gp holds the address of _gp (global pointer)
+gp_relative_operand(EA,Index,GpValue+as(Offset,address)):-
+    instruction(EA,_,_,Operation,Op1,_,0,0,_,_),
+    (
+        arch.load_operation(Operation),
+        Index = 1
+        ;
+        arch.store_operation(Operation),
+        Index = 2
+    ),
+    op_indirect(Op1,"NONE","GP","NONE",_,Offset,_),
+    symbol(GpValue,_,_,_,_,_,_,_,"_gp").
+
+// Global entries
+// These symbols point to stubs into the .MIPS.stubs section.
+// we use `abi_intrinsic` to rename them and let the compiler add new stubs.
+abi_intrinsic(SymbolEA,Symbol),
+got_reference(GotEntry,Symbol):-
+    symbol(SymbolEA,_,_,_,_,_, ".dynsym",Index,Symbol),
+    dynamic_entry("MIPS_GOTSYM",FirstIndex),
+    dynamic_entry("MIPS_LOCAL_GOTNO",NumLocalEntries),
+    Index >= FirstIndex,
+    loaded_section(Beg,_,".got"),
+    GotEntry = Beg + NumLocalEntries*4 + (Index-FirstIndex)*4.
+
+// Local entries
+got_reference(Got_entry,SymbolName):-
+    symbolic_expr(Got_entry,4,SymbolName,0),
+    loaded_section(Beg,_,".got"),
+    Got_entry >= Beg,
+    dynamic_entry("MIPS_LOCAL_GOTNO",NumLocalEntries),
+    Got_entry < Beg+4*NumLocalEntries.
+
+.decl hi_load(ea:address, reg:register, upper:number)
+
+// LUI <Register> <Immediate>
+hi_load(EA,Reg,Upper):-
+    instruction_get_operation(EA, "LUI"),
+    instruction_get_op(EA, 1, BaseOp),
+    instruction_get_op(EA, 2, RegOp),
+    op_immediate(BaseOp, Upper),
+    op_regdirect_contains_reg(RegOp,Reg).
+
+.decl hi_load_prop(reg_restore_ea:address, ea:address, reg:register, upper:number, type:symbol)
+
+hi_load_prop(EA,EA,Reg,Upper,"direct"):-
+    hi_load(EA,Reg,Upper).
+
+hi_load_prop(RegLoadEA,EA,Reg2,Upper,"stack-restore"):-
+    hi_load(EA,Reg,Upper),
+    reg_def_use.def_used(EA,Reg,RegStoreEA,_),
+    stack_def_use.def_used(RegStoreEA,_,RegLoadEA,_,_),
+    arch.load(RegLoadEA,_,_,Reg2,_,_,_,_).
+
+hi_load_prop(MoveEA,EA,Reg2,Upper,"move"):-
+    hi_load(EA,Reg,Upper),
+    reg_def_use.def_used(EA,Reg,MoveEA,_),
+    arch.move_reg_reg(MoveEA,Reg2,Reg).
+
+// Split-loads -------------------------------------------------------
+.decl split_load_candidate(ea_hi:address, ea_lo:address, dest:address, type:symbol)
+
+.decl split_load_point(ea:address, nextea:address, dest:address, type:symbol, point:number, why:symbol)
+
+.decl split_load_conflict(ea:address, nextea:address, dest:address, type:symbol, ea2:address, nextea2:address, dest2:address, type2:symbol)
+
+.decl split_load_total_points(ea:address, nextea:address, dest:address, type:symbol, points:number)
+
+.decl discarded_split_load(ea:address, nextea:address, dest:address, type:symbol, points:number)
+
+// Compute an immediate load performed across two consecutive instructions
+.decl split_load(ea:address, nextea:address, dest:address, type:symbol)
+
+// Compute an immediate load/store performed across two separate instructions
+.decl split_loadstore(ea:address, nextea:address, dest:address)
+
+
+// E.g., lui reg, hi(xxx)
+//       addiu reg2, reg, lo(xxx)
+// or
+// E.g., lui reg, hi(xxx)
+//       sw reg, n(sp)
+//       lw reg2, n(sp)
+//       addiu reg3, reg2, lo(xxx)
+// reg is store to stack and restored
+// or
+// E.g., lui reg, hi(xxx)
+//       move reg2, reg
+//       addiu reg3, reg2, lo(xxx)
+split_load_candidate(EA_hi, EA_lo, as(Upper*2^16+Offset,address), "ADDIU") :-
+    hi_load_prop(RegRestoreEA,EA_hi,Reg2,Upper,_),
+    reg_def_use.def_used(RegRestoreEA,Reg2,EA_lo,_),
+    instruction_get_operation(EA_lo, "ADDIU"),
+    arch.reg_arithmetic_operation(EA_lo,_,Reg2,_,Offset).
+
+// PIC
+// E.g., lui reg, hi(xxx)
+//       addiu reg2, reg, lo(xxx)
+//       addu reg3, reg2, t9
+split_load_candidate(EA_hi, EA_lo, as(Upper*2^16+Offset+T9Value,address), "ADDU") :-
+    // lui reg, hi(xxx)
+    hi_load(EA_hi,Reg,Upper),
+    // NOTE: This assumes t9 holds the address of the current function, and
+    //       lui is the first instruction of the current function.
+    // A sufficient condition is that the lui instruction is
+    // at the beginning of a block.
+    code_in_block(EA_hi, EA_hi),
+    // TODO: Find a way of safely getting the function-entry address for t9.
+
+    reg_def_use.def_used(EA_hi,Reg,EA_lo,_),
+    EA_hi != EA_lo,
+    // addiu reg2, reg, lo(xxx)
+    instruction_get_operation(EA_lo, "ADDIU"),
+    arch.reg_arithmetic_operation(EA_lo,Reg2,Reg,_,Offset),
+
+    reg_def_use.def_used(EA_lo,Reg2,EA_addu,_),
+    EA_lo != EA_addu,
+
+    // addu reg3, reg2, t9
+    instruction_get_operation(EA_addu, "ADDU"),
+    arch.reg_reg_arithmetic_operation(EA_addu,_,Reg2,"T9",1,0), // RA too?
+    T9Value = as(EA_hi, number).
+
+// E.g., lui reg, hi(xxx)
+//       lw/sw reg2, lo(xxx)(reg)
+// or
+// E.g., lui reg, hi(xxx)
+//       sw reg, n(sp)
+//       lw reg2, n(sp)
+//       lw/sw reg3, lo(xxx)(reg2)
+// reg is store to stack and restored
+// or
+// E.g., lui reg, hi(xxx)
+//       move reg2, reg
+//       lw/sw reg3, lo(xxx)(reg2)
+split_load_candidate(EA_hi, EA_lo, as(Upper*2^16+Offset,address), "LoadStore") :-
+    hi_load_prop(RegRestoreEA,EA_hi,Reg,Upper,_),
+    reg_def_use.def_used(RegRestoreEA,Reg,EA_lo,_),
+
+    // lw/sw reg3, lo(xxx)(reg2)
+    arch.memory_access(_,EA_lo,_,_,_,Reg,"NONE",1,Offset).
+
+split_load_point(EA_hi,EA_lo,Dest_addr,Type,0,"base"):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type).
+
+// Heuristic 1: If the order of hi and lo is backward, it may be
+// false-positive.
+split_load_point(EA_hi,EA_lo,Dest_addr,Type,-1,"hi-lo-backward"):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type),
+    EA_hi > EA_lo.
+
+// Heuristic 2: If the hi and lo are in different functions, it may be
+// false-positive. Note that function_entry cannot be used here due to cyclic
+// negation. For now, fde_addresses is used instead.
+split_load_point(EA_hi,EA_lo,Dest_addr,Type,-5,"maybe-in-different-function"):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type),
+    fde_addresses(Begin,_),
+    EA_hi < Begin,
+    Begin < EA_lo.
+
+// Heuristics 3: ADDU candidates rely on several assumptions.
+// If those assumptions are false, we subtract points.
+
+split_load_point(EA_hi,EA_lo,Dest_addr,"ADDU",-1,"t9 cannot have a function pointer"):-
+//  lui reg, hi(xxx)
+//  addiu reg2, reg, lo(xxx)
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,"ADDU"),
+    reg_def_use.def_used(EA_lo,Reg,EA_addu,_),
+    EA_lo != EA_addu,
+    // addu reg3, reg2, t9
+    instruction_get_operation(EA_addu, "ADDU"),
+    arch.reg_reg_arithmetic_operation(EA_addu,_,Reg,"T9",1,0),
+    // t9 cannot be a function pointer if it is
+    // the result of a product.
+    reg_def_use.def_used(EA_def_t9,"T9",EA_addu,_),
+    value_reg(EA_def_t9,"T9",_,_,Mult,_,_), Mult>1.
+
+// TODO: Add more heuristics if needed.
+
+split_load_conflict(EA_hi,EA_lo,Dest_addr,Type,EA_hi2,EA_lo2,Dest_addr2,Type2):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type),
+    split_load_candidate(EA_hi2,EA_lo2,Dest_addr2,Type2),
+    // Ordering to avoid duplicates
+    (
+        EA_hi < EA_hi2
+        ;
+        EA_hi = EA_hi2, EA_lo < EA_lo2
+        ;
+        EA_hi = EA_hi2, EA_lo = EA_lo2, Dest_addr < Dest_addr2
+    ),
+    // If two split_loads share either lo or hi or both, and the dest addresses
+    // are different, then they conflict.
+    (
+        EA_lo = EA_lo2
+        ;
+        EA_hi = EA_hi2
+    ),
+    Dest_addr != Dest_addr2.
+
+
+split_load_total_points(EA_hi,EA_lo,Dest_addr,Type,Points):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type),
+    Points = sum X:{split_load_point(EA_hi,EA_lo,Dest_addr,Type,X,_)}.
+
+split_load(EA_hi, EA_lo, Dest_addr, Type) :-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,Type),
+    Type != "LoadStore",
+    !discarded_split_load(EA_hi,EA_lo,Dest_addr,Type,_).
+
+split_loadstore(EA_hi, EA_lo, Dest_addr):-
+    split_load_candidate(EA_hi,EA_lo,Dest_addr,"LoadStore"),
+    !discarded_split_load(EA_hi,EA_lo,Dest_addr,"LoadStore",_).
+
+discarded_split_load(EA_hi,EA_lo,Dest_addr,Type,Points):-
+    split_load_conflict(EA_hi1,EA_lo1,Dest_addr1,Type1,EA_hi2,EA_lo2,Dest_addr2,Type2),
+    split_load_total_points(EA_hi1,EA_lo1,Dest_addr1,Type1,Points1),
+    split_load_total_points(EA_hi2,EA_lo2,Dest_addr2,Type2,Points2),
+    (
+        Points1 < Points2,
+        EA_hi = EA_hi1,
+        EA_lo = EA_lo1,
+        Dest_addr = Dest_addr1,
+        Type = Type1,
+        Points = Points1
+        ;
+        Points1 > Points2,
+        EA_hi = EA_hi2,
+        EA_lo = EA_lo2,
+        Dest_addr = Dest_addr2,
+        Type = Type2,
+        Points = Points2
+    ).
+
+
+.decl base_addr_offset_operand(ea:address, next_ea:address, dest:address)
+
+// e.g., lw v0, -32696(gp)  <-- v0: MIPS_BASE_ADDRESS
+//       addiu a0, v0, 2560 <-- 2560: offset from MIPS_BASE_ADDRESS to target L
+// ->
+//       lw v0, %got(L)(gp)
+//       addiu a0, v0, %lo(L)
+base_addr_offset_operand(EA,NextEA,Dest_addr):-
+    gp_relative_operand(EA,1,_),
+    value_reg(EA,Reg,_,"NONE",_,Value,_),
+    instruction_get_operation(EA, Operation),
+    arch.load_operation(Operation),
+    !split_loadstore(_,EA,_),
+
+    reg_def_use.def_used(EA,Reg,NextEA,_),
+    EA != NextEA,
+
+    // ADDIU <Register> <Register> <Offset>
+    // e.g. addiu reg2, reg, Offset
+    arch.reg_arithmetic_operation(NextEA,_,Reg,_,Offset),
+
+    // Ensure the loaded register is only used in the add. Some examples that
+    // should not match:
+    // * a loop index:
+    //       lw $v1, %got(array)($gp)
+    //   loop:
+    //       sw $v0, 0($v1)
+    //       addiu $v1, $v1, 4
+    //       bne $v0, $a0,.loop
+    // * a loop limit:
+    //       lw $s0, %got(array)($gp)
+    //       addiu $s2,$s0,40
+    //   loop:
+    //       lw $a2, 0($s0)
+    //       ...
+    //       addiu $s0, $s0, 4
+    //       bne $s0, $s2,.loop
+    // TODO: can we identify MIPS_BASE_ADDRESS and this is that .got entry? (is
+    // that some single location in a binary?)
+    0 = count : { reg_def_use.def_used(EA,Reg,OtherEA,_), OtherEA != NextEA },
+
+    Dest_addr = as(Value+Offset,address),
+    (
+        code(Dest_addr)
+        ;
+        data_segment(Begin,End),
+        Dest_addr >= Begin, Dest_addr <= End
+        ;
+        symbol(Dest_addr,_,_,_,_,_,_,_,_)
+        ;
+        bss_section_limits(Begin,End),
+        Dest_addr >= Begin, Dest_addr <= End
+    ).
+
+symbolic_operand_attribute(EA,1,"GOT"):-
+    base_addr_offset_operand(EA,_,_).
+
+symbolic_operand_attribute(EA,2,"LO"):-
+    base_addr_offset_operand(_,EA,_).
+
+// Hi
+symbolic_operand_attribute(EA, 1, "HI"):-
+    (
+        split_load(EA, _, Dest_addr, _)
+        ;
+        split_loadstore(EA, _, Dest_addr)
+    ),
+    (
+        function_inference.function_entry(Dest_addr)
+        ;
+        data_segment(Begin,End),
+        Dest_addr >= Begin,
+        Dest_addr <= End
+        ;
+        symbol(Dest_addr,_,_,_,_,_,_,_,_)
+        ;
+        got_reference(Dest_addr,_)
+    ).
+
+// Lo
+symbolic_operand_attribute(EA, Index, "LO"):-
+    (
+        split_load(_,EA,Dest_addr,_),
+        Index = 2
+        ;
+        split_loadstore(_,EA,Dest_addr),
+        Index = 1
+    ),
+    (
+        function_inference.function_entry(Dest_addr)
+        ;
+        data_segment(Begin,End),
+        Dest_addr >= Begin,
+        Dest_addr <= End
+        ;
+        symbol(Dest_addr,_,_,_,_,_,_,_,_)
+        ;
+        got_reference(Dest_addr,_)
+    ).
+
+.decl symbolic_operand_mips_candidate(ea:address,index:operand_index, dest:address)
+
+symbolic_operand_mips_candidate(EA,Index,Dest):-
+    gp_relative_operand(EA,Index,Dest).
+
+symbolic_operand_mips_candidate(EA,1,Dest):-
+    split_load(EA,_,Dest,_).
+
+symbolic_operand_mips_candidate(EA,2,Dest):-
+    split_load(_,EA,Dest,_).
+
+symbolic_operand_mips_candidate(EA,1,Dest):-
+    split_loadstore(EA,_,Dest).
+
+symbolic_operand_mips_candidate(EA,1,Dest):-
+    split_loadstore(_,EA,Dest).
+
+// E.g., lw t9, %got(puts)(gp)
+symbolic_operand_attribute(EA,Index,"GOT"):-
+    symbolic_operand_mips_candidate(EA,Index,Got_entry),
+    got_reference(Got_entry,_).
+
+symbolic_operand(EA,1,Dest_addr,"data"):-
+    base_addr_offset_operand(EA,_,Dest_addr).
+
+symbolic_operand(EA,2,Dest_addr,"data"):-
+    base_addr_offset_operand(_,EA,Dest_addr).
+
+symbol_minus_symbol(EA,4,EA,GP_addr,1,0):-
+    split_load(EA,_,_,"ADDU"),
+    symbol(GP_addr,_,_,_,_,_,_,_,"_gp").
+
+symbol_minus_symbol(EA,4,PrevEA,GP_addr,1,0):-
+    split_load(PrevEA,EA,_,"ADDU"),
+    symbol(GP_addr,_,_,_,_,_,_,_,"_gp").
+
+symbolic_operand_candidate(EA,Op_index,Dest_addr,Type):-
+    binary_type("EXEC"),
+    code(EA),
+    symbolic_operand_mips_candidate(EA,Op_index,Dest_addr),
+    !base_addr_offset_operand(EA,_,_),
+    (
+        code(Dest_addr), Type="code"
+        ;
+        data_segment(Begin,End),
+        Dest_addr >= Begin, Dest_addr <= End,
+        Type = "data"
+        ;
+        symbol(Dest_addr,_,_,_,_,_,_,_,_),
+        Type = "data"
+    ).
+
+// Deal with pie and relocatable code
+symbolic_operand_candidate(EA,Op_index,Dest,Type):-
+    !binary_type("EXEC"),
+    code(EA),
+    symbolic_operand_mips_candidate(EA,Op_index,Dest),
+    !base_addr_offset_operand(EA,_,_),
+    (
+        code(Dest), Type = "code"
+        ;
+        data_segment(Begin,End),
+        Dest >= Begin,
+        Dest <= End,
+        Type = "data"
+    ).
+
+symbolic_operand_point(EA,Op_index,1,"lookup-got"):-
+    symbolic_operand_candidate(EA,Op_index,_,_),
+    instruction_get_op(EA,Op_index,Op),
+    op_indirect(Op,"NONE","GP","NONE",1,_,_),
+    def_used_for_address(EA,_,_).
+
+.decl mips_stubs_section(name:symbol)
+
+mips_stubs_section(".MIPS.stubs").
+
+.decl mips_stubs_entry(Block:address,Function:symbol)
+
+mips_stubs_entry(Block,Function):-
+    mips_stubs_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+    // Reuse the definition of plt_entry_candidate since the pattern
+    // is the same.
+    plt_entry_candidate(EA,GotIndex),
+    symbol(_,_,_,_,_,_, ".dynsym",GotIndex,Function),
+    code_in_refined_block(EA,Block).
+
+.decl plt_entry_candidate(EA:address,GotIndex:unsigned)
+
+// Pattern-matching.1:
+//   lw $t9, _GLOBAL_OFFSET_TABLE_($gp)
+//   move $t7,$ra
+//   jalr $t9
+//   addiu $t8,$zero,N
+// where N is the index of the target in the _GLOBAL_OFFSET_TABLE_.
+plt_entry_candidate(EA,as(GotIndex,unsigned)):-
+    // lw $t9, _GLOBAL_OFFSET_TABLE_($gp)
+    instruction(PrevEA2,_,_,"LW",Op1,Op2,0,0,_,_),
+    op_regdirect_contains_reg(Op2,"T9"),
+    op_indirect(Op1,"NONE","GP","NONE",_,Offset,_),
+    symbol(GpValue,_,_,_,_,_,_,_,"_gp"),
+    loaded_section(GotBeg,_,".got"),
+    GotBeg = GpValue+as(Offset,address),
+
+    next(PrevEA2, PrevEA),
+
+    // move $t7,$ra
+    instruction(PrevEA,_,_,"MOVE",Op1_2,Op2_2,0,0,_,_),
+    op_regdirect_contains_reg(Op2_2,"T7"),
+    op_regdirect_contains_reg(Op1_2,"RA"),
+
+    next(PrevEA, EA),
+
+    // jalr $t9
+    instruction(EA,_,_,"JALR",Op1_3,0,0,0,_,_),
+    op_regdirect_contains_reg(Op1_3,"T9"),
+
+    next(EA, NextEA),
+
+    // addiu $t8,$zero,N
+    instruction(NextEA,_,_,"ADDIU",Op1_4,Op2_4,Op3_4,0,_,_),
+    op_regdirect_contains_reg(Op3_4,"T8"),
+    op_regdirect_contains_reg(Op1_4,"ZERO"),
+    op_immediate(Op2_4,GotIndex).
+
+plt_entry(EA,Function):-
+    plt_entry_candidate(EA,GotIndex),
+    symbol(_,_,_,_,_,_, ".dynsym",GotIndex,Function).
+
+// Pattern-matching.2:
+// E.g.,
+//   EA:       lui $t7,%hi(.L_XXXX)
+//   NextEA:   lw $t9,%lo(.L_XXXX)($t7)
+//   EA_JR:    jr $t9
+//   EA_ADDIU: addiu $t8,$t7,%lo(.L_XXXX) // delay-slot
+// or
+//   EA:       lui $t7,%hi(.L_XXXX)
+//   NextEA:   lw $t9,%lo(.L_XXXX)($t7)
+//   EA_ADDIU: addiu $t8,$t7,%lo(.L_XXXX)
+//   EA_JR:    jr $t9                     // no delay-slot
+//
+// NOTE: Cases of no delay-slot were observed
+plt_entry(EA,Function):-
+    plt_section(SecName),
+    loaded_section(Beg,End,SecName),
+    EA >= Beg,
+    EA < End,
+
+    next(EA,NextEA),
+
+    // NOTE: We can't use split_load_candidate here due to cyclic negation
+    hi_load(EA,Reg,Upper),
+    instruction_get_operation(NextEA, Operation),
+    arch.load_operation(Operation),
+    instruction_get_src_op(NextEA,_,Op),
+    op_indirect_mapped(Op,"NONE",Reg,"NONE",_,Offset,_),
+    Dest_addr = as(Upper*2^16+Offset,address),
+
+    next(NextEA,NextEA2),
+    next(NextEA2,NextEA3),
+
+    (
+        EA_JR = NextEA2, EA_ADDIU = NextEA3 // delay-slot
+        ;
+        EA_JR = NextEA3, EA_ADDIU = NextEA2 // no delay-slot
+    ),
+
+    // jr $t9
+    instruction(EA_JR,_,_,"JR",TargetOp,0,0,0,_,_),
+    op_regdirect_contains_reg(TargetOp,"T9"),
+
+    instruction_get_operation(EA_ADDIU, "ADDIU"),
+    arch.reg_arithmetic_operation(EA_ADDIU,_,Reg,_,Offset),
+
+    relocation(Dest_addr,_,Function,_,_,_,_).
+
+// If "jalr t9", where t9 is a concrete address value, it can be considered as
+// a direct-call.
+direct_call_resolved(EA,as(Dest,address)):-
+    instruction(EA,_,_,"JALR",Op,0,0,0,_,_),
+    op_regdirect_contains_reg(Op,"T9"),
+    reg_def_use.def_used(EA_def,"T9",EA,_),
+    value_reg(EA_def,"T9",_,"NONE",_,Dest,_).
+
+// lui reg1, hi(XXX)
+// lw reg2, lo(XXX)(reg1)
+// jr reg2
+resolved_jump(EA,as(Dest,address)):-
+    instruction(EA,_,_,"JR",Op,0,0,0,_,_),
+    op_regdirect_contains_reg(Op,Reg),
+    reg_def_use.def_used(EA_def,Reg,EA,_),
+    instruction_get_operation(EA_def, "LW"),
+    split_load_candidate(_,EA_def,Addr,_),
+    symbolic_data(Addr,4,Dest).
+
+abi_intrinsic(Address,Sym):-
+    symbol(Address,_,_,_,_,_,_,_,Sym),
+    (
+        Sym = "_gp"
+    ;
+        Sym = "__RLD_MAP"
+    ).
